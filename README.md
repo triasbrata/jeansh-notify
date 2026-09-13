@@ -70,7 +70,8 @@ The direct port goes stale when the connection drops or the app goes away, so
 the server as `sshbox-notify`:
 
 ```sh
-install -m 755 notify.sh /usr/local/bin/sshbox-notify    # or ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/triasbrata/jeansh-notify/main/notify.sh -o sshbox-notify
+install -m 755 sshbox-notify /usr/local/bin/    # or ~/.local/bin
 ```
 
 ```sh
@@ -152,7 +153,9 @@ bunx wrangler deploy
 ```
 
 - The service account JSON comes from the Firebase console: Project settings →
-  Service accounts → Generate new private key.
+  Service accounts → Generate new private key. A service account with only the
+  **Firebase Cloud Messaging API Admin** role is enough, and safer than the
+  default Admin SDK one.
 - The two rate limiters' `namespace_id`s in `wrangler.jsonc` must not clash with
   other Workers in your account.
 - Add your domain to `wrangler.jsonc` as a route, then point `sshbox-notify` at
