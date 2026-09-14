@@ -232,6 +232,11 @@ bunx wrangler deploy
   other Workers in your account.
 - Change the route in `wrangler.jsonc` to your own domain, then point
   `sshbox-notify` at it with `JEANSH_RELAY`.
+- To deploy on every push, connect the repo in the Cloudflare dashboard
+  (Workers & Pages → the Worker → Settings → Build): leave the build command
+  empty, set the deploy command to `bunx wrangler deploy` and the build variable
+  `BUN_VERSION` to `1.4.0`. This relay deploys that way from `main`. The secret
+  and the KV data stay on the Worker between deploys.
 
 ## Development
 
