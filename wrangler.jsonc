@@ -15,7 +15,7 @@
   "ratelimits": [
     // POST /v1/register, per client IP.
     { "name": "REGISTER_LIMIT", "namespace_id": "4101", "simple": { "limit": 10, "period": 60 } },
-    // POST /v1/send and DELETE /v1/key, per key id.
+    // POST /v1/send and POST /v1/register, per key id; never DELETE /v1/key.
     { "name": "SEND_LIMIT", "namespace_id": "4102", "simple": { "limit": 30, "period": 60 } }
   ]
 }

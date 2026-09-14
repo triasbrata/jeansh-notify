@@ -7,8 +7,9 @@ tapping it opens that host's terminal in Jeansh.
 Sending a push through Firebase Cloud Messaging needs the app's Firebase
 service account, which can't be handed out to every server. So the relay, a
 Cloudflare Worker, holds it. Jeansh makes a key pair for each host, registers
-the public key here with the phone's FCM token, and passes the private key to
-that host when it connects. The host signs every request with its key, the way
+the public key here with the phone's FCM token, in a request signed with that
+key, and passes the private key to that host when it connects. The host signs
+every request with its key, the way
 Indonesia's SNAP payment API signs requests, and the relay checks the signature
 against the registered key before it sends. The notification opens the host
 the key was registered for, so a server can only ever notify as itself.
@@ -52,7 +53,10 @@ Reconnect from Jeansh after changing either, then check with
 `echo ${LC_SSHBOX_KEY%%:*}`, which prints only the key id.
 
 Each host has its own key. **Deleting the host in Jeansh revokes its key** here,
-so that server can no longer send, and no other host's key is affected.
+so that server can no longer send, and no other host's key is affected. When the
+relay can't be reached, or refuses because the phone's clock is off, Jeansh
+hands the key to no host again and retries the revoke at its next start, until
+the relay confirms it.
 
 ## Two ways to deliver
 
@@ -97,8 +101,10 @@ Base URL `https://jeansh-notify.brata.cloud`. Errors come back as
 
 ### Signing
 
-`POST /v1/send` and `DELETE /v1/key` are signed the way SNAP (Standar Nasional
-Open API Pembayaran) signs requests, with the host's ECDSA P-256 key:
+Every call is signed the way SNAP (Standar Nasional Open API Pembayaran) signs
+requests, with a host's ECDSA P-256 key: `POST /v1/register` with the key it
+registers, and `POST /v1/send` and `DELETE /v1/key` with the key registered
+under `X-PARTNER-ID`.
 
 | Header | Value |
 |---|---|
@@ -122,12 +128,13 @@ The relay checks, in this order:
 
 | Status | `error` | When |
 |---|---|---|
-| 401 | `unknown key` | no `X-PARTNER-ID`, or no such key: never registered, revoked, or deleted after a 410 |
+| 401 | `unknown key` | a send or revoke with no `X-PARTNER-ID`, or no such key: never registered, revoked, or deleted after a 410 |
+| 401 | `X-PARTNER-ID is not publicKey's key id` | a register whose `X-PARTNER-ID` isn't the key id of the `publicKey` in its body |
 | 401 | `stale or bad timestamp` | `X-TIMESTAMP` isn't in the format, or is more than 300 seconds from the relay's clock |
 | 400 | `X-EXTERNAL-ID must be …` | `X-EXTERNAL-ID` is missing or not in the format |
 | 401 | `bad signature` | the signature isn't the key's over this string, for example because the body, method or path changed |
 | 409 | `duplicate X-EXTERNAL-ID` | the key already used this external id in the last 10 minutes |
-| 429 | `too many requests` | more than 30 signed requests a minute with one key |
+| 429 | `too many requests` | more than 30 sends and registers a minute with one key; a revoke is never limited, so a key sending at its limit can still be revoked |
 
 A 401 `stale or bad timestamp` from a request that looks right usually means the
 server's clock is off; check it with `date -u`.
@@ -158,24 +165,33 @@ curl -sS https://jeansh-notify.brata.cloud/v1/send \
 
 ### `POST /v1/register`
 
-The app calls this for each host key. It isn't signed. The body is
+The app calls this for each host key, signed as under [Signing](#signing) with
+that same key, so only a holder of its private key can point it at a phone. The
+body is
 
 ```json
 {"token": "<FCM registration token>", "publicKey": "<base64 SPKI DER>", "host": "<host id>"}
 ```
 
-with an ECDSA P-256 public key and a host id of at most 100 characters. The
-relay checks the token with an FCM dry run, and answers the key id:
-`jnk_` and the first 32 characters of the unpadded base64url SHA-256 of the
-SPKI DER. Registering the same key again answers the same id and takes the new
-token.
+with an ECDSA P-256 public key and a host id of at most 100 characters.
+`X-PARTNER-ID` is the key's id: `jnk_` and the first 32 characters of the
+unpadded base64url SHA-256 of the SPKI DER. The relay checks, in this order,
+the rate from the client's IP, the body, that `X-PARTNER-ID` is `publicKey`'s
+id, then the rest of [Signing](#signing) against `publicKey`, and last the
+token, with an FCM dry run. It answers the key id. Registering the same key
+again answers the same id and takes the new token and host.
 
 | Status | When |
 |---|---|
 | 200 | `{"keyId": "jnk_…"}` |
-| 400 | no token or host, a public key that isn't ECDSA P-256, or a token FCM says is invalid |
-| 429 | more than 10 registrations a minute from one IP |
+| 400 | no token or host, a public key that isn't ECDSA P-256, a bad `X-EXTERNAL-ID`, or a token FCM says is invalid |
+| 401, 409 | see [Signing](#signing) |
+| 429 | more than 10 registrations a minute from one IP, or 30 signed requests a minute with the key |
 | 502 | FCM failed; the error gives only its HTTP status and error code |
+
+A host's servers hold its private key too, so a server can register its own key
+again, with another token or host id. That moves its own host's pushes, and
+never another host's.
 
 ### `POST /v1/send`
 
@@ -199,7 +215,7 @@ the body can change that.
 
 Signed with the key to revoke, with no body. The relay deletes the key and
 answers 204. After that the key can't sign anything, so asking again answers
-401 `unknown key`.
+401 `unknown key`. A revoke is never rate-limited.
 
 ## What the relay stores
 

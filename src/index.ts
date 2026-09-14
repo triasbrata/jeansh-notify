@@ -1,8 +1,9 @@
 // Jeansh push relay.
 //
 // The app makes a key pair for each host, registers the public key here with
-// the phone's FCM token, and hands the private key to that host. The host signs
-// each request with it, SNAP-style, and the relay sends the message to the
+// the phone's FCM token, in a request that key signs, and hands the private key
+// to that host. The host signs each request with it, SNAP-style, and the relay
+// sends the message to the
 // phone through FCM HTTP v1, signed in with a service account that servers never
 // see. Which host sent it comes from the key, never from the message.
 
@@ -62,7 +63,12 @@ async function register(req: Request, env: Env): Promise<Response> {
 	const ip = req.headers.get("cf-connecting-ip") ?? "unknown";
 	if (!(await env.REGISTER_LIMIT.limit({ key: ip })).success) return fail(429, "too many requests");
 
-	const { token, publicKey, host } = ((await req.json().catch(() => null)) ?? {}) as Record<string, unknown>;
+	const body = new Uint8Array(await req.arrayBuffer());
+	let fields: unknown;
+	try {
+		fields = JSON.parse(new TextDecoder().decode(body));
+	} catch {}
+	const { token, publicKey, host } = (fields ?? {}) as Record<string, unknown>;
 	if (typeof token !== "string" || !token || token.length > 4096) {
 		return fail(400, "token must be an FCM registration token");
 	}
@@ -77,13 +83,21 @@ async function register(req: Request, env: Env): Promise<Response> {
 		return fail(400, "publicKey must be the base64 SPKI DER of an ECDSA P-256 key");
 	}
 
+	// Proof of possession: signed like a send, with the key being registered,
+	// so a public key alone can't point that key's pushes at another phone.
+	// ponytail: the key's holders are the phone and that host's servers, so a
+	// server can still move its own key to another token or host id; a device
+	// key of the app's own, never handed to a server, signing registers instead
+	// would close that.
+	const keyId = "jnk_" + b64url(await digest(der)).slice(0, 32);
+	if (req.headers.get("x-partner-id") !== keyId) return fail(401, "X-PARTNER-ID is not publicKey's key id");
+	const refusal = await unsigned(req, env, keyId, b64(der), body);
+	if (refusal) return refusal;
+
 	const check = await fcm(env, { validate_only: true, message: { token } });
 	if (check.status === 404 || BAD_TOKEN.includes(check.code)) return fail(400, "FCM does not accept this token");
 	if (check.status !== 200) return fcmFailed(check);
 
-	// ponytail: whoever holds the public key can re-register it with another
-	// token; the key never leaves the phone and the relay, so that is the phone.
-	const keyId = "jnk_" + b64url(await digest(der)).slice(0, 32);
 	const entry: Entry = { publicKey: b64(der), token, host, created: new Date().toISOString() };
 	await env.KEYS.put(`k:${keyId}`, JSON.stringify(entry));
 	return json(200, { keyId });
@@ -123,16 +137,31 @@ async function revoke(req: Request, env: Env): Promise<Response> {
 	return new Response(null, { status: 204 });
 }
 
-// The key and body of a request signed SNAP-style, or the answer refusing it.
+// The stored key and body of a request signed SNAP-style, or the answer
+// refusing it.
 async function verified(
 	req: Request,
 	env: Env,
 ): Promise<{ keyId: string; entry: Entry; body: Uint8Array<ArrayBuffer> } | Response> {
-	const header = (name: string) => req.headers.get(name) ?? "";
-	const keyId = header("x-partner-id");
+	const keyId = req.headers.get("x-partner-id") ?? "";
 	const stored = /^jnk_[\w-]{32}$/.test(keyId) ? await env.KEYS.get(`k:${keyId}`) : null;
 	if (!stored) return fail(401, "unknown key");
+	const entry = JSON.parse(stored) as Entry;
+	const body = new Uint8Array(await req.arrayBuffer());
+	return (await unsigned(req, env, keyId, entry.publicKey, body)) ?? { keyId, entry, body };
+}
 
+// The answer refusing a request that publicKey, keyId's, did not sign
+// SNAP-style over body, or null once it is let through: its external id is
+// then recorded against replays.
+async function unsigned(
+	req: Request,
+	env: Env,
+	keyId: string,
+	publicKey: string,
+	body: Uint8Array<ArrayBuffer>,
+): Promise<Response | null> {
+	const header = (name: string) => req.headers.get(name) ?? "";
 	const time = header("x-timestamp");
 	if (!TIMESTAMP.test(time) || !(Math.abs(Date.parse(time) - Date.now()) <= SKEW * 1000)) {
 		return fail(401, "stale or bad timestamp");
@@ -142,19 +171,21 @@ async function verified(
 		return fail(400, "X-EXTERNAL-ID must be 16 to 64 of A-Z, a-z, 0-9 and -");
 	}
 
-	const entry = JSON.parse(stored) as Entry;
-	const body = new Uint8Array(await req.arrayBuffer());
 	const text = [req.method, new URL(req.url).pathname, hex(await digest(body)), time, externalId].join(":");
-	if (!(await verify(entry.publicKey, header("x-signature"), text))) return fail(401, "bad signature");
+	if (!(await verify(publicKey, header("x-signature"), text))) return fail(401, "bad signature");
 
 	// ponytail: KV is eventually consistent, so a replay landing on another
 	// Cloudflare location within about a minute may pass; a Durable Object
 	// would make this strict.
 	const seen = `n:${keyId}:${externalId}`;
 	if ((await env.KEYS.get(seen)) !== null) return fail(409, "duplicate X-EXTERNAL-ID");
-	if (!(await env.SEND_LIMIT.limit({ key: keyId })).success) return fail(429, "too many requests");
+	// Never a revoke: a server sending at its key's limit must not keep the
+	// phone from revoking that key. A revoke passes once, then the key is gone.
+	if (req.method !== "DELETE" && !(await env.SEND_LIMIT.limit({ key: keyId })).success) {
+		return fail(429, "too many requests");
+	}
 	await env.KEYS.put(seen, "1", { expirationTtl: 2 * SKEW });
-	return { keyId, entry, body };
+	return null;
 }
 
 // Whether signature, the base64 DER that openssl writes, signs text with the

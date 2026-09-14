@@ -124,16 +124,19 @@ async function newKey(): Promise<Key> {
 	return { id: "jnk_" + sha256(spki).digest("base64url").slice(0, 32), pair, spki, pkcs8 };
 }
 
-const register = (fields: object, ip = "203.0.113.7") =>
-	call("POST", "/v1/register", {
-		headers: { "cf-connecting-ip": ip, "content-type": "application/json" },
-		body: JSON.stringify(fields),
-	});
+// POST /v1/register with fields, signed with key as the app signs it.
+const register = async (key: Key, fields: unknown, o: Options = {}, ip = "203.0.113.7") => {
+	const req = await sign(key, "POST", "/v1/register", { body: JSON.stringify(fields), ...o });
+	return call("POST", "/v1/register", { ...req, headers: { ...req.headers, "cf-connecting-ip": ip } });
+};
+
+// What the app registers key with.
+const fieldsOf = (key: Key, token = "fcm-token-1", host = HOST) => ({ token, publicKey: b64(key.spki), host });
 
 // A key registered for host, with FCM's dry run forgotten.
 async function registered(host = HOST, token = "fcm-token-1") {
 	const key = await newKey();
-	expect((await register({ token, publicKey: b64(key.spki), host })).status).toBe(200);
+	expect((await register(key, fieldsOf(key, token, host))).status).toBe(200);
 	fcmCalls = [];
 	return key;
 }
@@ -209,14 +212,14 @@ const message = (data: Record<string, string>) => ({
 
 test("register dry-runs the token with FCM and stores the public key under its key id", async () => {
 	const key = await newKey();
-	const res = await register({ token: "fcm-token-1", publicKey: b64(key.spki), host: HOST });
+	const res = await register(key, fieldsOf(key));
 	expect(res.status).toBe(200);
 	expect((await res.json()) as object).toEqual({ keyId: key.id });
 	expect(key.id).toMatch(/^jnk_[A-Za-z0-9_-]{32}$/);
 	expect(fcmCalls).toEqual([
 		{ auth: "Bearer ya29.test", body: { validate_only: true, message: { token: "fcm-token-1" } } },
 	]);
-	expect([...kv.keys()]).toEqual([`k:${key.id}`]);
+	expect(hostKeys()).toEqual([`k:${key.id}`]);
 	expect(JSON.parse(kv.get(`k:${key.id}`)!)).toEqual({
 		publicKey: b64(key.spki),
 		token: "fcm-token-1",
@@ -227,10 +230,48 @@ test("register dry-runs the token with FCM and stores the public key under its k
 
 test("registering the same key again answers the same id and takes the new token", async () => {
 	const key = await registered(HOST, "old-token");
-	const res = await register({ token: "new-token", publicKey: b64(key.spki), host: HOST });
+	const res = await register(key, fieldsOf(key, "new-token"));
 	expect((await res.json()) as object).toEqual({ keyId: key.id });
-	expect([...kv.keys()]).toEqual([`k:${key.id}`]);
+	expect(hostKeys()).toEqual([`k:${key.id}`]);
 	expect(JSON.parse(kv.get(`k:${key.id}`)!).token).toBe("new-token");
+});
+
+test("only the key's holder can register it, so a public key alone can't move a host's pushes to another phone", async () => {
+	const key = await registered(HOST, "fcm-token-1");
+	const thief = await newKey();
+	const theirs = fieldsOf(key, "thief-token");
+	const unsigned = { headers: { "content-type": "application/json" }, body: JSON.stringify(theirs) };
+	expect(await error(call("POST", "/v1/register", unsigned))).toEqual([401, "X-PARTNER-ID is not publicKey's key id"]);
+	expect(await error(register(thief, theirs))).toEqual([401, "X-PARTNER-ID is not publicKey's key id"]);
+	expect(await error(register(thief, theirs, { as: key.id }))).toEqual([401, "bad signature"]);
+	expect(JSON.parse(kv.get(`k:${key.id}`)!).token).toBe("fcm-token-1");
+	expect(fcmCalls).toEqual([]);
+});
+
+test("a register is checked for its body, then for the key's signature as a send is, all before FCM", async () => {
+	const key = await newKey();
+	const fields = fieldsOf(key);
+	const stale = snapTime(Date.now() - 305_000);
+	const other = await newKey();
+	expect((await register(key, { ...fields, host: "" }, { as: other.id, time: stale })).status).toBe(400);
+	expect(await error(register(key, fields, { as: other.id, time: stale }))).toEqual([
+		401,
+		"X-PARTNER-ID is not publicKey's key id",
+	]);
+	expect(await error(register(key, fields, { time: stale, id: "short" }))).toEqual([401, "stale or bad timestamp"]);
+	expect((await register(key, fields, { id: "short", signs: "POST:/v1/send" })).status).toBe(400);
+	expect(await error(register(key, fields, { signs: "POST:/v1/send" }))).toEqual([401, "bad signature"]);
+	const moved = JSON.stringify(fieldsOf(key, "other-token"));
+	expect(await error(register(key, fields, { sent: moved }))).toEqual([401, "bad signature"]);
+	expect(fcmCalls).toEqual([]);
+	expect(kv.size).toBe(0);
+
+	// What the phone signed can't be sent again, not even to undo a revoke.
+	const req = await sign(key, "POST", "/v1/register", { body: JSON.stringify(fields) });
+	expect((await call("POST", "/v1/register", req)).status).toBe(200);
+	expect((await revoke(key)).status).toBe(204);
+	expect(await error(call("POST", "/v1/register", req))).toEqual([409, "duplicate X-EXTERNAL-ID"]);
+	expect(hostKeys()).toEqual([]);
 });
 
 test("register refuses a public key that isn't an ECDSA P-256 SPKI, before FCM", async () => {
@@ -248,7 +289,7 @@ test("register refuses a public key that isn't an ECDSA P-256 SPKI, before FCM",
 		b64(key.spki.subarray(0, 90)),
 		b64(crypto.getRandomValues(new Uint8Array(91))),
 	]) {
-		expect(await error(register({ token: "fcm-token-1", publicKey, host: HOST }))).toEqual([
+		expect(await error(register(key, { token: "fcm-token-1", publicKey, host: HOST }))).toEqual([
 			400,
 			"publicKey must be the base64 SPKI DER of an ECDSA P-256 key",
 		]);
@@ -258,7 +299,8 @@ test("register refuses a public key that isn't an ECDSA P-256 SPKI, before FCM",
 });
 
 test("register refuses a missing token or host without asking FCM", async () => {
-	const publicKey = b64((await newKey()).spki);
+	const key = await newKey();
+	const publicKey = b64(key.spki);
 	for (const body of [
 		{ publicKey, host: HOST },
 		{ token: 5, publicKey, host: HOST },
@@ -269,7 +311,7 @@ test("register refuses a missing token or host without asking FCM", async () => 
 		null,
 		"nope",
 	]) {
-		expect((await register(body as object)).status).toBe(400);
+		expect((await register(key, body)).status).toBe(400);
 	}
 	expect((await call("POST", "/v1/register", { body: "{" })).status).toBe(400);
 	expect(fcmCalls).toEqual([]);
@@ -277,22 +319,20 @@ test("register refuses a missing token or host without asking FCM", async () => 
 });
 
 test("register refuses a token FCM calls invalid and stores nothing", async () => {
-	const publicKey = b64((await newKey()).spki);
+	const key = await newKey();
 	for (const reply of [fcmError(400, "INVALID_ARGUMENT"), fcmError(404, "UNREGISTERED")]) {
 		fcmReply = reply;
-		expect(await error(register({ token: "not-a-token", publicKey, host: HOST }))).toEqual([
-			400,
-			"FCM does not accept this token",
-		]);
+		expect(await error(register(key, fieldsOf(key, "not-a-token")))).toEqual([400, "FCM does not accept this token"]);
 	}
-	expect(kv.size).toBe(0);
+	expect(hostKeys()).toEqual([]);
 });
 
 test("register is rate-limited per client IP", async () => {
-	const fields = { token: "t", publicKey: b64((await newKey()).spki), host: HOST };
-	for (let i = 0; i < 10; i++) expect((await register(fields, "203.0.113.7")).status).toBe(200);
-	expect((await register(fields, "203.0.113.7")).status).toBe(429);
-	expect((await register(fields, "203.0.113.8")).status).toBe(200);
+	const key = await newKey();
+	const fields = fieldsOf(key, "t");
+	for (let i = 0; i < 10; i++) expect((await register(key, fields, {}, "203.0.113.7")).status).toBe(200);
+	expect((await register(key, fields, {}, "203.0.113.7")).status).toBe(429);
+	expect((await register(key, fields, {}, "203.0.113.8")).status).toBe(200);
 });
 
 test("send pushes the old tool's FCM message, with hostId from the key and never from the body", async () => {
@@ -445,15 +485,18 @@ test("send answers 400 for bad input, before FCM", async () => {
 	expect((await send(key, { body: "hi", title: null })).status).toBe(200);
 });
 
-test("signed requests are rate-limited per key, after the external id is checked", async () => {
+test("sends and registers are rate-limited per key, after the external id is checked, and a revoke never is", async () => {
+	// Its register is the first of a's 30.
 	const a = await registered();
 	const b = await registered("other-host", "fcm-token-2");
 	const id = crypto.randomUUID();
 	expect((await send(a, { body: "hi" }, { id })).status).toBe(200);
-	for (let i = 1; i < 30; i++) expect((await send(a, { body: "hi" })).status).toBe(200);
+	for (let i = 2; i < 30; i++) expect((await send(a, { body: "hi" })).status).toBe(200);
 	expect((await send(a, { body: "hi" })).status).toBe(429);
+	expect((await register(a, fieldsOf(a))).status).toBe(429);
 	expect((await send(a, { body: "hi" }, { id })).status).toBe(409);
-	expect((await revoke(a)).status).toBe(429);
+	expect((await revoke(a)).status).toBe(204);
+	expect(await error(send(a, { body: "hi" }))).toEqual([401, "unknown key"]);
 	expect((await send(b, { body: "hi" })).status).toBe(200);
 });
 
