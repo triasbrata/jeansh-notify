@@ -3,17 +3,19 @@
   "name": "jeansh-notify",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-11",
+  "routes": [{ "pattern": "jeansh-notify.brata.cloud", "custom_domain": true }],
   // The FCM_SERVICE_ACCOUNT secret holds the Firebase service account JSON:
   //   wrangler secret put FCM_SERVICE_ACCOUNT < service-account.json
   "kv_namespaces": [
-    // SHA-256 hex of a relay key -> {"token": FCM token, "created": ISO time}.
+    // k:<key id> -> {"publicKey", "token", "host", "created"}, one per host key;
+    // n:<key id>:<X-EXTERNAL-ID> -> "1" for 10 minutes, the external ids seen.
     { "binding": "KEYS", "id": "cd59e9629c3a4bf1a8afa26bc459cca6" }
   ],
   // namespace_id only has to be unique within the Cloudflare account.
   "ratelimits": [
     // POST /v1/register, per client IP.
     { "name": "REGISTER_LIMIT", "namespace_id": "4101", "simple": { "limit": 10, "period": 60 } },
-    // POST /v1/send, per relay key hash.
+    // POST /v1/send and DELETE /v1/key, per key id.
     { "name": "SEND_LIMIT", "namespace_id": "4102", "simple": { "limit": 30, "period": 60 } }
   ]
 }
